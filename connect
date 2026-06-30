@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# connect — SSH server launcher with fzf fuzzy search
+# Config: ~/.ssh/connect.conf
+# Format: name  host  [user]  [port]  [key]
+
+CONFIG="${HOME}/.ssh/connect.conf"
+EXAMPLE_CONFIG='# SSH server list for the `connect` command
+# Format: name  host  [user]  [port]  [key]
+# Fields are whitespace-separated. user, port and key are optional.
+#
+# The "key" field can be either:
+#   * a path (contains "/", e.g. ~/.ssh/id_ed25519) — an identity file on disk;
+#   * a bare name (e.g. homelab) — the name/comment of a key held by your SSH
+#     agent (as shown by `ssh-add -L`). connect pins that single agent key so
+#     only one identity is offered. Use this with the Bitwarden/Vaultwarden
+#     agent to avoid "Too many authentication failures" when the agent holds
+#     many keys — no private key is ever written to disk.
+# If "key" is omitted, ssh uses normal auth: any SSH agent on $SSH_AUTH_SOCK
+# (offering all its keys) and then a password prompt.
+#
+# A config-wide fallback key can be set with a "@key" directive (see below);
+# it applies to any server that does not name its own key.
+#
+# Examples:
+# @key            ~/.ssh/id_ed25519
+# work-server     192.168.1.10
+# dev-box         10.0.0.5           deploy   2222
+# staging         staging.example.com ubuntu
+# backup          192.168.1.10       deploy   22     ~/.ssh/connect_backup
+# homelab         homelab.example.com deploy   22     homelab
+'
+
+# Check dependencies
+if ! command -v fzf &>/dev/null; then
+    echo "Error: fzf is required but not installed."
+    echo "Install it with: brew install fzf"
+    exit 1
+fi
+
+# Bootstrap config if missing
+if [[ ! -f "$CONFIG" ]]; then
+    printf '%s' "$EXAMPLE_CONFIG" > "$CONFIG"
+    echo "Created example config at $CONFIG"
+    echo "Edit it to add your SSH servers, then run 'connect' again."
+    exit 0
+fi
+
+# Read config, skip comments and blank lines, build fzf display lines
+# Each record is tab-separated: display, name, host, user, port, key
+declare -a entries=()
+default_key=""
+while IFS= read -r line; do
+    # Strip leading whitespace, skip comments and blank lines
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    # @key directive: config-wide fallback identity file for keyless entries
+    if [[ "$line" == @key[[:space:]]* ]]; then
+        read -r _ default_key _ <<< "$line"
+        default_key="${default_key/#\~/$HOME}"
+        continue
+    fi
+
+    read -r name host user port key extra <<< "$line"
+    [[ -z "$name" || -z "$host" ]] && continue
+
+    user="${user:-$USER}"
+    port="${port:-22}"
+    key="${key:-$default_key}"
+    key="${key/#\~/$HOME}"
+
+    # Mark key-auth entries in the picker
+    marker=""
+    [[ -n "$key" ]] && marker="🔑"
+
+    # Tab-separated internal record; display columns with printf
+    display=$(printf "%-20s  %-30s  %-15s  %-5s %s" "$name" "$host" "$user" "$port" "$marker")
+    entries+=("${display}	${name}	${host}	${user}	${port}	${key}")
+done < "$CONFIG"
+
+if [[ ${#entries[@]} -eq 0 ]]; then
+    echo "No servers found in $CONFIG"
+    echo "Add entries in the format:  name  host  [user]  [port]"
+    exit 1
+fi
+
+# Direct connect if a name argument is given
+if [[ -n "$1" ]]; then
+    selected=$(printf '%s\n' "${entries[@]}" | awk -F'\t' -v name="$1" 'tolower($2) == tolower(name)' | head -1)
+    if [[ -z "$selected" ]]; then
+        selected=$(printf '%s\n' "${entries[@]}" | awk -F'\t' -v name="$1" 'index(tolower($2), tolower(name))' | head -1)
+    fi
+    if [[ -z "$selected" ]]; then
+        echo "Error: no server named '$1' found in $CONFIG"
+        exit 1
+    fi
+else
+    # Present fzf — search matches on display columns (name + host + user + port)
+    selected=$(printf '%s\n' "${entries[@]}" | \
+        fzf \
+            --prompt="SSH> " \
+            --header="Select a server (type to filter by name or host)" \
+            --height=40% \
+            --layout=reverse \
+            --with-nth=1 \
+            --delimiter=$'\t' \
+            --ansi)
+
+    # Cancelled
+    [[ -z "$selected" ]] && exit 0
+fi
+
+# Parse fields from the selected tab-separated record
+IFS=$'\t' read -r _display _name host user port key <<< "$selected"
+
+# Build SSH command
+ssh_args=()
+[[ "$port" != "22" ]] && ssh_args+=(-p "$port")
+
+# Clean up any ephemeral public key on exit (we never write private keys to disk)
+tmp_pubkey=""
+cleanup() { [[ -n "$tmp_pubkey" ]] && rm -f "$tmp_pubkey"; }
+trap cleanup EXIT
+
+if [[ -n "$key" ]]; then
+    if [[ "$key" == */* ]]; then
+        # Identity file on disk: force this key only, no agent fallback
+        if [[ -f "$key" ]]; then
+            ssh_args+=(-i "$key" -o IdentitiesOnly=yes)
+        else
+            echo "Warning: key file '$key' for ${_name} not found; using default auth" >&2
+        fi
+    else
+        # Agent key name: pin the single matching key served by the SSH agent
+        # (e.g. the Bitwarden/Vaultwarden agent). The private key stays in the
+        # agent — only its public part is written to a temp file so ssh offers
+        # exactly one identity, avoiding "Too many authentication failures".
+        pub=$(ssh-add -L 2>/dev/null | awk -v n="$key" '
+            { comment = $0; sub(/^[^ ]+[ ]+[^ ]+[ ]+/, "", comment) }
+            comment == n { print; exit }')
+        if [[ -n "$pub" ]]; then
+            tmp_pubkey=$(mktemp "${TMPDIR:-/tmp}/connect-XXXXXX") || tmp_pubkey=""
+            if [[ -n "$tmp_pubkey" ]]; then
+                printf '%s\n' "$pub" > "$tmp_pubkey"
+                ssh_args+=(-i "$tmp_pubkey" -o IdentitiesOnly=yes)
+            fi
+        else
+            echo "Warning: agent key '$key' for ${_name} not found in ssh-add -L; using default auth" >&2
+        fi
+    fi
+fi
+ssh_args+=("${user}@${host}")
+
+echo "Connecting to ${_name} (${user}@${host}${port:+:${port}})${key:+ using key ${key}}..."
+ssh "${ssh_args[@]}"
