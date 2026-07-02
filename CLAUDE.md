@@ -29,7 +29,7 @@ When an entry has a `key` (per-server column, or the `@key` config-wide fallback
 
 Because a bare name is resolved against the live agent, the script no longer `exec`s ssh — it runs ssh as a child so the `EXIT` trap can clean up the temp public key after the session.
 
-With no `key`, ssh uses normal auth — any agent on `$SSH_AUTH_SOCK` (offering *all* its keys) then a password prompt.
+With no `key`, ssh uses normal auth — any agent on `$SSH_AUTH_SOCK` (offering *all* its keys) then a password prompt. A `key` of `-` or `none` means **password-only**: it skips the `@key` fallback *and* passes `-o PubkeyAuthentication=no -o IdentitiesOnly=yes` so ssh offers no keys at all and goes straight to the password prompt. Use this when the agent holds more keys than the server's `MaxAuthTries` (default 6) allows and you want to reach that server by password — it prevents the "Too many authentication failures" error. It shows a 🔓 marker in the picker.
 
 ## Config format
 
@@ -41,6 +41,7 @@ dev-box         10.0.0.5           deploy   2222
 staging         staging.example.com ubuntu
 backup          192.168.1.10       deploy   22     ~/.ssh/connect_backup
 homelab         homelab.example.com deploy   22     homelab
+open-box        10.0.0.9           deploy   22     -
 ```
 
-Fields are whitespace-separated; `user` defaults to `$USER`, `port` defaults to `22`, `key` is optional. The `key` field is a path if it contains `/`, otherwise an agent key name (see "How it works"). The `@key <path>` directive sets a fallback identity file used for any entry without its own `key`. Comments (`#`) and blank lines are ignored.
+Fields are whitespace-separated; `user` defaults to `$USER`, `port` defaults to `22`, `key` is optional. The `key` field is a path if it contains `/`, otherwise an agent key name (see "How it works"). The `@key <path>` directive sets a fallback identity file used for any entry without its own `key`. A `key` of `-` or `none` means password-only auth: it opts the entry out of the `@key` fallback and disables pubkey auth entirely (`-o PubkeyAuthentication=no`), so no keys are offered — useful to avoid "Too many authentication failures" when the agent holds many keys. Comments (`#`) and blank lines are ignored.

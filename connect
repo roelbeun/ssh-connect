@@ -19,7 +19,10 @@ EXAMPLE_CONFIG='# SSH server list for the `connect` command
 # (offering all its keys) and then a password prompt.
 #
 # A config-wide fallback key can be set with a "@key" directive (see below);
-# it applies to any server that does not name its own key.
+# it applies to any server that does not name its own key. To reach a server by
+# password only — no key offered at all — set its key to "-" (or "none"). This
+# skips the @key fallback and disables pubkey auth, avoiding "Too many
+# authentication failures" when the agent holds more keys than the server allows.
 #
 # Examples:
 # @key            ~/.ssh/id_ed25519
@@ -28,6 +31,7 @@ EXAMPLE_CONFIG='# SSH server list for the `connect` command
 # staging         staging.example.com ubuntu
 # backup          192.168.1.10       deploy   22     ~/.ssh/connect_backup
 # homelab         homelab.example.com deploy   22     homelab
+# open-box        10.0.0.9           deploy   22     -
 '
 
 # Check dependencies
@@ -66,12 +70,25 @@ while IFS= read -r line; do
 
     user="${user:-$USER}"
     port="${port:-22}"
-    key="${key:-$default_key}"
-    key="${key/#\~/$HOME}"
+    # A key of "-" or "none" means "no key at all": skip the @key fallback AND
+    # turn off pubkey auth entirely (go straight to password). This avoids
+    # "Too many authentication failures" on servers where the agent would
+    # otherwise offer more keys than the server's MaxAuthTries allows. The
+    # internal sentinel "@none" flows through to the ssh-building step below.
+    if [[ "$key" == "-" || "$key" == "none" ]]; then
+        key="@none"
+    else
+        key="${key:-$default_key}"
+        key="${key/#\~/$HOME}"
+    fi
 
-    # Mark key-auth entries in the picker
+    # Mark key-auth entries in the picker (🔑 pinned key, 🔓 password-only)
     marker=""
-    [[ -n "$key" ]] && marker="🔑"
+    if [[ "$key" == "@none" ]]; then
+        marker="🔓"
+    elif [[ -n "$key" ]]; then
+        marker="🔑"
+    fi
 
     # Tab-separated internal record; display columns with printf
     display=$(printf "%-20s  %-30s  %-15s  %-5s %s" "$name" "$host" "$user" "$port" "$marker")
@@ -122,7 +139,11 @@ tmp_pubkey=""
 cleanup() { [[ -n "$tmp_pubkey" ]] && rm -f "$tmp_pubkey"; }
 trap cleanup EXIT
 
-if [[ -n "$key" ]]; then
+if [[ "$key" == "@none" ]]; then
+    # Password-only: offer no keys at all (skip agent + on-disk identities) so
+    # a fat agent can't trip the server's MaxAuthTries.
+    ssh_args+=(-o PubkeyAuthentication=no -o IdentitiesOnly=yes)
+elif [[ -n "$key" ]]; then
     if [[ "$key" == */* ]]; then
         # Identity file on disk: force this key only, no agent fallback
         if [[ -f "$key" ]]; then
@@ -151,5 +172,10 @@ if [[ -n "$key" ]]; then
 fi
 ssh_args+=("${user}@${host}")
 
-echo "Connecting to ${_name} (${user}@${host}${port:+:${port}})${key:+ using key ${key}}..."
+if [[ "$key" == "@none" ]]; then
+    auth_note=" (password auth, no keys offered)"
+else
+    auth_note="${key:+ using key ${key}}"
+fi
+echo "Connecting to ${_name} (${user}@${host}${port:+:${port}})${auth_note}..."
 ssh "${ssh_args[@]}"
